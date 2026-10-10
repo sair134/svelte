@@ -33,7 +33,7 @@ const no_compiler_imports = {
 	}
 };
 
-/** @type {import('eslint').Linter.FlatConfig[]} */
+/** @type {import('eslint').Linter.Config[]} */
 export default [
 	...svelte_config,
 	{
@@ -90,6 +90,7 @@ export default [
 			'**/tests',
 			'packages/svelte/scripts/process-messages/templates/*.js',
 			'packages/svelte/scripts/_bundle.js',
+			'packages/svelte/scripts/_baseline/**',
 			'packages/svelte/src/compiler/errors.js',
 			'packages/svelte/src/internal/client/errors.js',
 			'packages/svelte/src/internal/client/warnings.js',
@@ -102,6 +103,7 @@ export default [
 			'playgrounds/sandbox/**',
 			// exclude top level config files
 			'*.config.js',
+			'vitest-xhtml-environment.ts',
 			// documentation can contain invalid examples
 			'documentation',
 			'tmp/**'

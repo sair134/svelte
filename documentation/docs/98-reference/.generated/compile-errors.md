@@ -63,8 +63,28 @@ Event attribute must be a JavaScript expression, not a string
 ### attribute_invalid_sequence_expression
 
 ```
-Sequence expressions are not allowed as attribute/directive values in runes mode, unless wrapped in parentheses
+Comma-separated expressions are not allowed as attribute/directive values in runes mode, unless wrapped in parentheses
 ```
+
+An attribute value cannot be a comma-separated sequence of expressions — in other words this is disallowed:
+
+```svelte
+<div class={size, color}>...</div>
+```
+
+Instead, make sure that the attribute value contains a single expression. In the example above it's likely that this was intended (see the [class documentation](class) for more details):
+
+```svelte
+<div class={[size, color]}>...</div>
+```
+
+If you _do_ need to use the comma operator for some reason, wrap the sequence in parentheses:
+
+```svelte
+<div class={(size, color)}>...</div>
+```
+
+Note that this will evaluate to `color`, ignoring `size`.
 
 ### attribute_invalid_type
 
@@ -193,7 +213,7 @@ Cyclical dependency detected: %cycle%
 ### const_tag_invalid_placement
 
 ```
-`{@const}` must be the immediate child of `{#snippet}`, `{#if}`, `{:else if}`, `{:else}`, `{#each}`, `{:then}`, `{:catch}`, `<svelte:fragment>`, `<svelte:boundary` or `<Component>`
+`{@const}` must be the immediate child of `{#snippet}`, `{#if}`, `{:else if}`, `{:else}`, `{#each}`, `{:then}`, `{:catch}`, `<svelte:fragment>`, `<svelte:boundary>` or `<Component>`
 ```
 
 ### const_tag_invalid_reference
@@ -376,7 +396,19 @@ Invalid selector
 ### declaration_duplicate_module_import
 
 ```
-Cannot declare a variable with the same name as an import inside `<script module>`
+Cannot declare a variable with the same name as an import from `<script module>`
+```
+
+### declaration_tag_invalid_type
+
+```
+Declaration tags must be `let` or `const` declarations
+```
+
+### declaration_tag_no_legacy_mode
+
+```
+Declaration tags cannot be used in legacy mode
 ```
 
 ### derived_invalid_export
@@ -645,6 +677,12 @@ Cannot use `$$restProps` in runes mode
 `let:` directive at invalid position
 ```
 
+### let_directive_snippet_conflict
+
+```
+Cannot use `let:` directives on a component that has a `children` snippet. Use snippet parameters instead (e.g. `{#snippet children({ %name% })}`)
+```
+
 ### mixed_event_handler_syntaxes
 
 ```
@@ -787,6 +825,18 @@ Cannot use `%rune%` rune in non-runes mode
 
 ```
 Cannot use rune without parentheses
+```
+
+Runes are keywords rather than values — they can't be assigned to a variable or passed to a function, only called. Referencing one without parentheses is therefore an error...
+
+```js
+let count = $state;
+```
+
+...whether it's a rune like `$state` or one reached through a property, like `$derived.by`. Add the parentheses, along with any arguments the rune expects:
+
+```js
+let count = $state(0);
 ```
 
 ### rune_removed
@@ -1102,7 +1152,7 @@ Value must be %list%, if specified
 ### svelte_options_invalid_customelement
 
 ```
-"customElement" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: "open" | "none"; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }
+"customElement" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: "open" | "none" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }
 ```
 
 ### svelte_options_invalid_customelement_props
@@ -1114,8 +1164,10 @@ Value must be %list%, if specified
 ### svelte_options_invalid_customelement_shadow
 
 ```
-"shadow" must be either "open" or "none"
+"shadow" must be either "open", "none" or `ShadowRootInit` object.
 ```
+
+See https://developer.mozilla.org/en-US/docs/Web/API/Element/attachShadow#options for more information on valid shadow root constructor options
 
 ### svelte_options_invalid_tagname
 

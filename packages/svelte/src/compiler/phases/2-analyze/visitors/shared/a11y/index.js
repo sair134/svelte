@@ -45,7 +45,7 @@ import {
 import { is_event_attribute, is_text_attribute } from '../../../../../utils/ast.js';
 import { list } from '../../../../../utils/string.js';
 import { walk } from 'zimmerframe';
-import fuzzymatch from '../../../../1-parse/utils/fuzzymatch.js';
+import fuzzymatch from '../../../../../utils/fuzzymatch.js';
 import { is_content_editable_binding } from '../../../../../../utils.js';
 import * as w from '../../../../../warnings.js';
 
@@ -100,6 +100,11 @@ export function check_element(node, context) {
 		}
 	}
 
+	const interactivity = element_interactivity(node.name, attribute_map);
+	const is_interactive = interactivity === ElementInteractivity.Interactive;
+	const is_non_interactive = interactivity === ElementInteractivity.NonInteractive;
+	const is_static = interactivity === ElementInteractivity.Static;
+
 	for (const attribute of node.attributes) {
 		if (attribute.type !== 'Attribute') continue;
 
@@ -133,7 +138,7 @@ export function check_element(node, context) {
 			if (
 				name === 'aria-activedescendant' &&
 				!is_dynamic_element &&
-				!is_interactive_element(node.name, attribute_map) &&
+				!is_interactive &&
 				!attribute_map.has('tabindex') &&
 				!has_spread
 			) {
@@ -167,9 +172,9 @@ export function check_element(node, context) {
 					if (
 						current_role === get_implicit_role(node.name, attribute_map) &&
 						// <ul role="list"> is ok because CSS list-style:none removes the semantics and this is a way to bring them back
-						!['ul', 'ol', 'li'].includes(node.name) &&
-						// <a role="link" /> is ok because without href the a tag doesn't have a role of link
-						!(node.name === 'a' && !attribute_map.has('href'))
+						!['ul', 'ol', 'li', 'menu'].includes(node.name) &&
+						// <a role="link" /> and <area role="link" /> are ok because without href they don't have a role of link
+						!((node.name === 'a' || node.name === 'area') && !attribute_map.has('href'))
 					) {
 						w.a11y_no_redundant_roles(attribute, current_role);
 					}
@@ -215,7 +220,7 @@ export function check_element(node, context) {
 						!is_hidden_from_screen_reader(node.name, attribute_map) &&
 						!is_presentation_role(current_role) &&
 						is_interactive_roles(current_role) &&
-						is_static_element(node.name, attribute_map) &&
+						is_static &&
 						!attribute_map.get('tabindex')
 					) {
 						const has_interactive_handlers = [...handlers].some((handler) =>
@@ -229,7 +234,7 @@ export function check_element(node, context) {
 					// no-interactive-element-to-noninteractive-role
 					if (
 						!has_spread &&
-						is_interactive_element(node.name, attribute_map) &&
+						is_interactive &&
 						(is_non_interactive_roles(current_role) || is_presentation_role(current_role))
 					) {
 						w.a11y_no_interactive_element_to_noninteractive_role(node, node.name, current_role);
@@ -238,7 +243,7 @@ export function check_element(node, context) {
 					// no-noninteractive-element-to-interactive-role
 					if (
 						!has_spread &&
-						is_non_interactive_element(node.name, attribute_map) &&
+						is_non_interactive &&
 						is_interactive_roles(current_role) &&
 						!a11y_non_interactive_element_to_interactive_role_exceptions[node.name]?.includes(
 							current_role
@@ -291,13 +296,13 @@ export function check_element(node, context) {
 			!is_dynamic_element &&
 			!is_hidden_from_screen_reader(node.name, attribute_map) &&
 			(!role || is_non_presentation_role) &&
-			!is_interactive_element(node.name, attribute_map) &&
+			!is_interactive &&
 			!has_spread
 		) {
 			const has_key_event =
 				handlers.has('keydown') || handlers.has('keyup') || handlers.has('keypress');
 			if (!has_key_event) {
-				w.a11y_click_events_have_key_events(node);
+				w.a11y_click_events_have_key_events(node, node.name);
 			}
 		}
 	}
@@ -307,11 +312,7 @@ export function check_element(node, context) {
 	);
 
 	// no-noninteractive-tabindex
-	if (
-		!is_dynamic_element &&
-		!is_interactive_element(node.name, attribute_map) &&
-		!is_interactive_roles(role_static_value)
-	) {
+	if (!is_dynamic_element && !is_interactive && !is_interactive_roles(role_static_value)) {
 		const tab_index = attribute_map.get('tabindex');
 		const tab_index_value = get_static_text_value(tab_index);
 		if (tab_index && (tab_index_value === null || Number(tab_index_value) >= 0)) {
@@ -341,9 +342,8 @@ export function check_element(node, context) {
 		!has_contenteditable_attr &&
 		!is_hidden_from_screen_reader(node.name, attribute_map) &&
 		!is_presentation_role(role_static_value) &&
-		((!is_interactive_element(node.name, attribute_map) &&
-			is_non_interactive_roles(role_static_value)) ||
-			(is_non_interactive_element(node.name, attribute_map) && !role))
+		((!is_interactive && is_non_interactive_roles(role_static_value)) ||
+			(is_non_interactive && !role))
 	) {
 		const has_interactive_handlers = [...handlers].some((handler) =>
 			a11y_recommended_interactive_handlers.includes(handler)
@@ -359,9 +359,9 @@ export function check_element(node, context) {
 		(!role || role_static_value !== null) &&
 		!is_hidden_from_screen_reader(node.name, attribute_map) &&
 		!is_presentation_role(role_static_value) &&
-		!is_interactive_element(node.name, attribute_map) &&
+		!is_interactive &&
 		!is_interactive_roles(role_static_value) &&
-		!is_non_interactive_element(node.name, attribute_map) &&
+		!is_non_interactive &&
 		!is_non_interactive_roles(role_static_value) &&
 		!is_abstract_role(role_static_value)
 	) {
@@ -373,11 +373,23 @@ export function check_element(node, context) {
 		}
 	}
 
-	if (!has_spread && handlers.has('mouseover') && !handlers.has('focus')) {
+	// `focus`/`blur` don't bubble, so an element that isn't focusable itself can only be notified
+	// about focus changes inside it through `focusin`/`focusout` — accept those as well
+	if (
+		!has_spread &&
+		handlers.has('mouseover') &&
+		!handlers.has('focus') &&
+		!handlers.has('focusin')
+	) {
 		w.a11y_mouse_events_have_key_events(node, 'mouseover', 'focus');
 	}
 
-	if (!has_spread && handlers.has('mouseout') && !handlers.has('blur')) {
+	if (
+		!has_spread &&
+		handlers.has('mouseout') &&
+		!handlers.has('blur') &&
+		!handlers.has('focusout')
+	) {
 		w.a11y_mouse_events_have_key_events(node, 'mouseout', 'blur');
 	}
 
@@ -644,33 +656,6 @@ function element_interactivity(tag_name, attribute_map) {
 }
 
 /**
- * @param {string} tag_name
- * @param {Map<string, AST.Attribute>} attribute_map
- * @returns {boolean}
- */
-function is_interactive_element(tag_name, attribute_map) {
-	return element_interactivity(tag_name, attribute_map) === ElementInteractivity.Interactive;
-}
-
-/**
- * @param {string} tag_name
- * @param {Map<string, AST.Attribute>} attribute_map
- * @returns {boolean}
- */
-function is_non_interactive_element(tag_name, attribute_map) {
-	return element_interactivity(tag_name, attribute_map) === ElementInteractivity.NonInteractive;
-}
-
-/**
- * @param {string} tag_name
- * @param {Map<string, AST.Attribute>} attribute_map
- * @returns {boolean}
- */
-function is_static_element(tag_name, attribute_map) {
-	return element_interactivity(tag_name, attribute_map) === ElementInteractivity.Static;
-}
-
-/**
  * @param {ARIARoleDefinitionKey} role
  * @param {string} tag_name
  * @param {Map<string, AST.Attribute>} attribute_map
@@ -824,10 +809,18 @@ function has_content(element) {
 		}
 
 		if (node.type === 'RegularElement' || node.type === 'SvelteElement') {
+			if (node.attributes.some((a) => a.type === 'Attribute' && a.name === 'popover')) {
+				continue;
+			}
+
 			if (
 				node.name === 'img' &&
 				node.attributes.some((node) => node.type === 'Attribute' && node.name === 'alt')
 			) {
+				return true;
+			}
+
+			if (node.name === 'selectedcontent') {
 				return true;
 			}
 

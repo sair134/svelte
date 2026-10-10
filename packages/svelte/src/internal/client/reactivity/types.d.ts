@@ -57,8 +57,8 @@ export interface Derived<V = unknown> extends Value<V>, Reaction {
 	fn: () => V;
 	/** Effects created inside this signal. Used to destroy those effects when the derived reruns or is cleaned up */
 	effects: null | Effect[];
-	/** Parent effect or derived */
-	parent: Effect | Derived | null;
+	/** Parent effect */
+	parent: Effect | null;
 }
 
 export interface EffectNodes {
@@ -103,3 +103,8 @@ export interface Effect extends Reaction {
 export type Source<V = unknown> = Value<V>;
 
 export type MaybeSource<T = unknown> = T | Source<T>;
+
+export interface Blocker {
+	promise: Promise<any>;
+	settled: boolean;
+}

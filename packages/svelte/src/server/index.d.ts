@@ -1,5 +1,7 @@
-import type { Csp, RenderOutput } from '#server';
+import type { Csp, RenderOutput } from './public.js';
 import type { ComponentProps, Component, SvelteComponent, ComponentType } from 'svelte';
+
+export type { Csp, RenderOutput, SyncRenderOutput, Sha256Source } from './public.js';
 
 /**
  * Only available on the server and when compiling with the `server` option.
@@ -17,6 +19,7 @@ export function render<
 					context?: Map<any, any>;
 					idPrefix?: string;
 					csp?: Csp;
+					transformError?: (error: unknown) => unknown | Promise<unknown>;
 				}
 			]
 		: [
@@ -26,6 +29,7 @@ export function render<
 					context?: Map<any, any>;
 					idPrefix?: string;
 					csp?: Csp;
+					transformError?: (error: unknown) => unknown | Promise<unknown>;
 				}
 			]
 ): RenderOutput;

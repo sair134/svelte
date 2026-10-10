@@ -98,10 +98,10 @@ export function process_children(nodes, initial, is_element, context) {
 
 			let child_state = context.state;
 
-			if (is_static_element(node, context.state)) {
+			if (is_static_element(node)) {
 				skipped += 1;
 			} else if (
-				node.type === 'EachBlock' &&
+				(node.type === 'EachBlock' || node.type === 'HtmlTag') &&
 				nodes.length === 1 &&
 				is_element &&
 				// In case it's wrapped in async the async logic will want to skip sibling nodes up until the end, hence we cannot make this controlled
@@ -137,9 +137,8 @@ export function process_children(nodes, initial, is_element, context) {
 
 /**
  * @param {AST.SvelteNode} node
- * @param {ComponentContext["state"]} state
  */
-function is_static_element(node, state) {
+export function is_static_element(node) {
 	if (node.type !== 'RegularElement') return false;
 	if (node.fragment.metadata.dynamic) return false;
 	if (is_custom_element_node(node)) return false; // we're setting all attributes on custom elements through properties
@@ -162,18 +161,13 @@ function is_static_element(node, state) {
 		}
 
 		if (
-			['input', 'textarea'].includes(node.name) &&
+			['input', 'textarea', 'select'].includes(node.name) &&
 			['value', 'checked'].includes(attribute.name)
 		) {
 			return false;
 		}
 
 		if (node.name === 'option' && attribute.name === 'value') {
-			return false;
-		}
-
-		// We need to apply src and loading after appending the img to the DOM for lazy loading to work
-		if (node.name === 'img' && attribute.name === 'loading') {
 			return false;
 		}
 

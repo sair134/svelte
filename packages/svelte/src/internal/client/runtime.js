@@ -1,6 +1,6 @@
-/** @import { Derived, Effect, Reaction, Signal, Source, Value } from '#client' */
+/** @import { Derived, Effect, Reaction, Source, Value } from '#client' */
 import { DEV } from 'esm-env';
-import { get_descriptors, get_prototype_of, index_of } from '../shared/utils.js';
+import { get_descriptors, get_prototype_of, includes, index_of } from '../shared/utils.js';
 import {
 	destroy_block_effect_children,
 	destroy_effect_children,
@@ -21,15 +21,16 @@ import {
 	REACTION_IS_UPDATING,
 	STALE_REACTION,
 	ERROR_VALUE,
-	WAS_MARKED,
-	MANAGED_EFFECT
+	MANAGED_EFFECT,
+	REACTION_RAN
 } from './constants.js';
 import { old_values } from './reactivity/sources.js';
 import {
-	destroy_derived_effects,
+	reactivity_loss_tracker,
 	execute_derived,
-	current_async_effect,
+	freeze_derived_effects,
 	recent_async_deriveds,
+	unfreeze_derived_effects,
 	update_derived
 } from './reactivity/deriveds.js';
 import { async_mode_flag, tracing_mode_flag } from '../flags/index.js';
@@ -44,25 +45,20 @@ import {
 	set_dev_current_component_function,
 	set_dev_stack
 } from './context.js';
-import * as w from './warnings.js';
 import {
 	Batch,
 	batch_values,
 	current_batch,
 	flushSync,
+	previous_batch,
 	schedule_effect
 } from './reactivity/batch.js';
 import { handle_error } from './error-handling.js';
 import { UNINITIALIZED } from '../../constants.js';
 import { captured_signals } from './legacy.js';
 import { without_reactive_context } from './dom/elements/bindings/shared.js';
-
-export let is_updating_effect = false;
-
-/** @param {boolean} value */
-export function set_is_updating_effect(value) {
-	is_updating_effect = value;
-}
+import { set_signal_status, update_derived_status } from './reactivity/status.js';
+import * as w from './warnings.js';
 
 export let is_destroying_effect = false;
 
@@ -92,18 +88,18 @@ export function set_active_effect(effect) {
 /**
  * When sources are created within a reaction, reading and writing
  * them within that reaction should not cause a re-run
- * @type {null | Source[]}
+ * @type {null | Set<Value>}
  */
 export let current_sources = null;
 
 /** @param {Value} value */
 export function push_reaction_value(value) {
-	if (active_reaction !== null && (!async_mode_flag || (active_reaction.f & DERIVED) !== 0)) {
-		if (current_sources === null) {
-			current_sources = [value];
-		} else {
-			current_sources.push(value);
-		}
+	if (
+		active_reaction !== null &&
+		((!async_mode_flag && (active_reaction.f & REACTION_IS_UPDATING) !== 0) ||
+			(active_reaction.f & DERIVED) !== 0)
+	) {
+		(current_sources ??= new Set()).add(value);
 	}
 }
 
@@ -113,18 +109,18 @@ export function push_reaction_value(value) {
  * and until a new dependency is accessed — we track this via `skipped_deps`
  * @type {null | Value[]}
  */
-let new_deps = null;
+export let new_deps = null;
 
-let skipped_deps = 0;
+export let skipped_deps = 0;
 
 /**
  * Tracks writes that the effect it's executed in doesn't listen to yet,
  * so that the dependency can be added to the effect later on if it then reads it
- * @type {null | Source[]}
+ * @type {null | Value[]}
  */
 export let untracked_writes = null;
 
-/** @param {null | Source[]} value */
+/** @param {null | Value[]} value */
 export function set_untracked_writes(value) {
 	untracked_writes = value;
 }
@@ -135,7 +131,7 @@ export function set_untracked_writes(value) {
  **/
 export let write_version = 1;
 
-/** @type {number} Used to version each read of a source of derived to avoid duplicating depedencies inside a reaction */
+/** @type {number} Used to version each read of a source of derived to avoid duplicating dependencies inside a reaction */
 let read_version = 0;
 
 export let update_version = read_version;
@@ -162,26 +158,19 @@ export function is_dirty(reaction) {
 		return true;
 	}
 
-	if (flags & DERIVED) {
-		reaction.f &= ~WAS_MARKED;
-	}
-
 	if ((flags & MAYBE_DIRTY) !== 0) {
-		var dependencies = reaction.deps;
+		var dependencies = /** @type {Value[]} */ (reaction.deps);
+		var length = dependencies.length;
 
-		if (dependencies !== null) {
-			var length = dependencies.length;
+		for (var i = 0; i < length; i++) {
+			var dependency = dependencies[i];
 
-			for (var i = 0; i < length; i++) {
-				var dependency = dependencies[i];
+			if (is_dirty(/** @type {Derived} */ (dependency))) {
+				update_derived(/** @type {Derived} */ (dependency));
+			}
 
-				if (is_dirty(/** @type {Derived} */ (dependency))) {
-					update_derived(/** @type {Derived} */ (dependency));
-				}
-
-				if (dependency.wv > reaction.wv) {
-					return true;
-				}
+			if (dependency.wv > reaction.wv) {
+				return true;
 			}
 		}
 
@@ -207,7 +196,7 @@ function schedule_possible_effect_self_invalidation(signal, effect, root = true)
 	var reactions = signal.reactions;
 	if (reactions === null) return;
 
-	if (!async_mode_flag && current_sources?.includes(signal)) {
+	if (!async_mode_flag && current_sources !== null && current_sources.has(signal)) {
 		return;
 	}
 
@@ -262,31 +251,8 @@ export function update_reaction(reaction) {
 		reaction.f |= REACTION_IS_UPDATING;
 		var fn = /** @type {Function} */ (reaction.fn);
 		var result = fn();
-		var deps = reaction.deps;
-
-		if (new_deps !== null) {
-			var i;
-
-			remove_reactions(reaction, skipped_deps);
-
-			if (deps !== null && skipped_deps > 0) {
-				deps.length = skipped_deps + new_deps.length;
-				for (i = 0; i < new_deps.length; i++) {
-					deps[skipped_deps + i] = new_deps[i];
-				}
-			} else {
-				reaction.deps = deps = new_deps;
-			}
-
-			if (effect_tracking() && (reaction.f & CONNECTED) !== 0) {
-				for (i = skipped_deps; i < deps.length; i++) {
-					(deps[i].reactions ??= []).push(reaction);
-				}
-			}
-		} else if (deps !== null && skipped_deps < deps.length) {
-			remove_reactions(reaction, skipped_deps);
-			deps.length = skipped_deps;
-		}
+		reaction.f |= REACTION_RAN;
+		var deps = update_dependencies(reaction);
 
 		// If we're inside an effect and we have untracked writes, then we need to
 		// ensure that if any of those untracked writes result in re-invalidation
@@ -298,7 +264,7 @@ export function update_reaction(reaction) {
 			deps !== null &&
 			(reaction.f & (DERIVED | MAYBE_DIRTY | DIRTY)) === 0
 		) {
-			for (i = 0; i < /** @type {Source[]} */ (untracked_writes).length; i++) {
+			for (var i = 0; i < /** @type {Source[]} */ (untracked_writes).length; i++) {
 				schedule_possible_effect_self_invalidation(
 					untracked_writes[i],
 					/** @type {Effect} */ (reaction)
@@ -312,6 +278,20 @@ export function update_reaction(reaction) {
 		// the same version
 		if (previous_reaction !== null && previous_reaction !== reaction) {
 			read_version++;
+
+			// update the `rv` of the previous reaction's deps — both existing and new —
+			// so that they are not added again
+			if (previous_reaction.deps !== null) {
+				for (let i = 0; i < previous_skipped_deps; i += 1) {
+					previous_reaction.deps[i].rv = read_version;
+				}
+			}
+
+			if (previous_deps !== null) {
+				for (const dep of previous_deps) {
+					dep.rv = read_version;
+				}
+			}
 
 			if (untracked_writes !== null) {
 				if (previous_untracked_writes === null) {
@@ -328,6 +308,9 @@ export function update_reaction(reaction) {
 
 		return result;
 	} catch (error) {
+		// still commit the deps read before the throw, otherwise deriveds connected by this run keep no reader and the reaction never re-runs when they change
+		update_dependencies(reaction);
+
 		return handle_error(error);
 	} finally {
 		reaction.f ^= REACTION_IS_UPDATING;
@@ -340,6 +323,45 @@ export function update_reaction(reaction) {
 		untracking = previous_untracking;
 		update_version = previous_update_version;
 	}
+}
+
+/**
+ * @param {Reaction} reaction
+ */
+function update_dependencies(reaction) {
+	var deps = reaction.deps;
+
+	// Don't remove reactions during fork;
+	// they must remain for when fork is discarded
+	var is_fork = current_batch?.is_fork;
+
+	if (new_deps !== null) {
+		var i;
+
+		if (!is_fork) {
+			remove_reactions(reaction, skipped_deps);
+		}
+
+		if (deps !== null && skipped_deps > 0) {
+			deps.length = skipped_deps + new_deps.length;
+			for (i = 0; i < new_deps.length; i++) {
+				deps[skipped_deps + i] = new_deps[i];
+			}
+		} else {
+			reaction.deps = deps = new_deps;
+		}
+
+		if (effect_tracking() && (reaction.f & CONNECTED) !== 0) {
+			for (i = skipped_deps; i < deps.length; i++) {
+				(deps[i].reactions ??= []).push(reaction);
+			}
+		}
+	} else if (!is_fork && deps !== null && skipped_deps < deps.length) {
+		remove_reactions(reaction, skipped_deps);
+		deps.length = skipped_deps;
+	}
+
+	return deps;
 }
 
 /**
@@ -372,18 +394,38 @@ function remove_reaction(signal, dependency) {
 		// Destroying a child effect while updating a parent effect can cause a dependency to appear
 		// to be unused, when in fact it is used by the currently-updating parent. Checking `new_deps`
 		// allows us to skip the expensive work of disconnecting and immediately reconnecting it
-		(new_deps === null || !new_deps.includes(dependency))
+		(new_deps === null || !includes.call(new_deps, dependency))
 	) {
-		set_signal_status(dependency, MAYBE_DIRTY);
-		// If we are working with a derived that is owned by an effect, then mark it as being
-		// disconnected and remove the mark flag, as it cannot be reliably removed otherwise
-		if ((dependency.f & CONNECTED) !== 0) {
-			dependency.f ^= CONNECTED;
-			dependency.f &= ~WAS_MARKED;
+		var derived = /** @type {Derived} */ (dependency);
+
+		if ((derived.f & CONNECTED) !== 0) {
+			derived.f ^= CONNECTED;
 		}
+
+		// In a fork it's possible that a derived is executed and gets reactions, then commits, but is
+		// never re-executed. This is possible when the derived is only executed once in the context
+		// of a new branch which happens before fork.commit() runs. In this case, the derived still has
+		// UNINITIALIZED as its value, and then when it's losing its reactions we need to ensure it stays
+		// DIRTY so it is reexecuted once someone wants its value again.
+		if (derived.v !== UNINITIALIZED) {
+			update_derived_status(derived);
+		}
+
+		// Call abort controller, noone's listening to this derived anymore
+		if (derived.ac !== null) {
+			without_reactive_context(() => {
+				/** @type {AbortController} */ (derived.ac).abort(STALE_REACTION);
+				derived.ac = null;
+				// ensure it reruns right away next time instead of potentially returning a rejected promise as its value
+				set_signal_status(derived, DIRTY);
+			});
+		}
+
+		// freeze any effects inside this derived
+		freeze_derived_effects(derived);
+
 		// Disconnect any reactions owned by this reaction
-		destroy_derived_effects(/** @type {Derived} **/ (dependency));
-		remove_reactions(/** @type {Derived} **/ (dependency), 0);
+		remove_reactions(derived, 0);
 	}
 }
 
@@ -415,10 +457,8 @@ export function update_effect(effect) {
 	set_signal_status(effect, CLEAN);
 
 	var previous_effect = active_effect;
-	var was_updating_effect = is_updating_effect;
 
 	active_effect = effect;
-	is_updating_effect = true;
 
 	if (DEV) {
 		var previous_component_fn = dev_current_component_function;
@@ -451,7 +491,6 @@ export function update_effect(effect) {
 			}
 		}
 	} finally {
-		is_updating_effect = was_updating_effect;
 		active_effect = previous_effect;
 
 		if (DEV) {
@@ -511,7 +550,7 @@ export function get(signal) {
 		// we don't add the dependency, because that would create a memory leak
 		var destroyed = active_effect !== null && (active_effect.f & DESTROYED) !== 0;
 
-		if (!destroyed && !current_sources?.includes(signal)) {
+		if (!destroyed && (current_sources === null || !current_sources.has(signal))) {
 			var deps = active_reaction.deps;
 
 			if ((active_reaction.f & REACTION_IS_UPDATING) !== 0) {
@@ -526,20 +565,26 @@ export function get(signal) {
 						skipped_deps++;
 					} else if (new_deps === null) {
 						new_deps = [signal];
-					} else if (!new_deps.includes(signal)) {
+					} else {
 						new_deps.push(signal);
 					}
 				}
 			} else {
-				// we're adding a dependency outside the init/update cycle
-				// (i.e. after an `await`)
-				(active_reaction.deps ??= []).push(signal);
+				// We're adding a dependency outside the init/update cycle (i.e. after an `await`).
+				// We have to deduplicate deps/reactions in this case or remove_reactions could
+				// disconnect deps/reactions that are actually still in use (if skip_deps says
+				// "disconnect all after this index" and some of the signals are also present in
+				// list prior to the cutoff index, i.e. that should be kept).
+				active_reaction.deps ??= [];
+				if (!includes.call(active_reaction.deps, signal)) {
+					active_reaction.deps.push(signal);
+				}
 
 				var reactions = signal.reactions;
 
 				if (reactions === null) {
 					signal.reactions = [active_reaction];
-				} else if (!reactions.includes(active_reaction)) {
+				} else if (!includes.call(reactions, active_reaction)) {
 					reactions.push(active_reaction);
 				}
 			}
@@ -547,19 +592,26 @@ export function get(signal) {
 	}
 
 	if (DEV) {
-		// TODO reinstate this, but make it actually work
-		// if (current_async_effect) {
-		// 	var tracking = (current_async_effect.f & REACTION_IS_UPDATING) !== 0;
-		// 	var was_read = current_async_effect.deps?.includes(signal);
+		if (
+			!untracking &&
+			reactivity_loss_tracker &&
+			// By checking that current/previous batch are null we filter out false positives.
+			// reactivity_loss_tracker is only reset after a microtask, so if a flush happens
+			// before that, we get warnings for things we shouldn't warn on.
+			current_batch === null &&
+			previous_batch === null &&
+			!reactivity_loss_tracker.warned &&
+			(reactivity_loss_tracker.effect.f & REACTION_IS_UPDATING) === 0 &&
+			!reactivity_loss_tracker.effect_deps.has(signal)
+		) {
+			reactivity_loss_tracker.warned = true;
 
-		// 	if (!tracking && !untracking && !was_read) {
-		// 		w.await_reactivity_loss(/** @type {string} */ (signal.label));
+			w.await_reactivity_loss(/** @type {string} */ (signal.label));
 
-		// 		var trace = get_error('traced at');
-		// 		// eslint-disable-next-line no-console
-		// 		if (trace) console.warn(trace);
-		// 	}
-		// }
+			var trace = get_error('traced at');
+			// eslint-disable-next-line no-console
+			if (trace) console.warn(trace);
+		}
 
 		recent_async_deriveds.delete(signal);
 
@@ -574,7 +626,7 @@ export function get(signal) {
 			if (signal.trace) {
 				signal.trace();
 			} else {
-				var trace = get_error('traced at');
+				trace = get_error('traced at');
 
 				if (trace) {
 					var entry = tracing_expressions.entries.get(signal);
@@ -596,14 +648,14 @@ export function get(signal) {
 		}
 	}
 
-	if (is_destroying_effect) {
-		if (old_values.has(signal)) {
-			return old_values.get(signal);
-		}
+	if (is_destroying_effect && old_values.has(signal)) {
+		return old_values.get(signal);
+	}
 
-		if (is_derived) {
-			var derived = /** @type {Derived} */ (signal);
+	if (is_derived) {
+		var derived = /** @type {Derived} */ (signal);
 
+		if (is_destroying_effect) {
 			var value = derived.v;
 
 			// if the derived is dirty and has reactions, or depends on the values that just changed, re-execute
@@ -619,17 +671,28 @@ export function get(signal) {
 
 			return value;
 		}
-	} else if (
-		is_derived &&
-		(!batch_values?.has(signal) || (current_batch?.is_fork && !effect_tracking()))
-	) {
-		derived = /** @type {Derived} */ (signal);
+
+		// connect disconnected deriveds when reading them inside a connected reaction
+		var should_connect =
+			(derived.f & CONNECTED) === 0 &&
+			!untracking &&
+			active_reaction !== null &&
+			(active_reaction.f & CONNECTED) !== 0;
+
+		var is_new = (derived.f & REACTION_RAN) === 0;
 
 		if (is_dirty(derived)) {
+			if (should_connect) {
+				// set the flag before `update_derived`, so that the derived
+				// is added as a reaction to its dependencies
+				derived.f |= CONNECTED;
+			}
+
 			update_derived(derived);
 		}
 
-		if (is_updating_effect && effect_tracking() && (derived.f & CONNECTED) === 0) {
+		if (should_connect && !is_new) {
+			unfreeze_derived_effects(derived);
 			reconnect(derived);
 		}
 	}
@@ -651,14 +714,21 @@ export function get(signal) {
  * @param {Derived} derived
  */
 function reconnect(derived) {
+	derived.f |= CONNECTED;
+
 	if (derived.deps === null) return;
 
-	derived.f ^= CONNECTED;
-
 	for (const dep of derived.deps) {
-		(dep.reactions ??= []).push(derived);
+		var reactions = dep.reactions;
+
+		if (reactions === null) {
+			dep.reactions = [derived];
+		} else if (!includes.call(reactions, derived)) {
+			reactions.push(derived);
+		}
 
 		if ((dep.f & DERIVED) !== 0 && (dep.f & CONNECTED) === 0) {
+			unfreeze_derived_effects(/** @type {Derived} */ (dep));
 			reconnect(/** @type {Derived} */ (dep));
 		}
 	}
@@ -716,41 +786,6 @@ export function untrack(fn) {
 	} finally {
 		untracking = previous_untracking;
 	}
-}
-
-const STATUS_MASK = ~(DIRTY | MAYBE_DIRTY | CLEAN);
-
-/**
- * @param {Signal} signal
- * @param {number} status
- * @returns {void}
- */
-export function set_signal_status(signal, status) {
-	signal.f = (signal.f & STATUS_MASK) | status;
-}
-
-/**
- * @param {Record<string | symbol, unknown>} obj
- * @param {Array<string | symbol>} keys
- * @returns {Record<string | symbol, unknown>}
- */
-export function exclude_from_object(obj, keys) {
-	/** @type {Record<string | symbol, unknown>} */
-	var result = {};
-
-	for (var key in obj) {
-		if (!keys.includes(key)) {
-			result[key] = obj[key];
-		}
-	}
-
-	for (var symbol of Object.getOwnPropertySymbols(obj)) {
-		if (Object.propertyIsEnumerable.call(obj, symbol) && !keys.includes(symbol)) {
-			result[symbol] = obj[symbol];
-		}
-	}
-
-	return result;
 }
 
 /**
